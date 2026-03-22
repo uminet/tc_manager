@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "dev": "br0",
+  "qdisc": {
+    "kind": "htb",
+    "handle": "1:",
+    "default": "9999",
+    "r2q": 10
+  },
+  "tree": {
+    "name": "root",
+    "id": "1:1",
+    "rate": "1000mbit",
+    "children": [
+        {
+            "name": "default",
+            "id": "1:9999",
+            "rate": "1000mbit",
+            "selectors": [
+                {
+                    "type": "fwmark",
+                    "mark": 9999
+                }
+            ]
+        },
+        {
+            "name": "groupA",
+            "rate": "10mbit",
+            "ceil": "10mbit",
+            "children": [
+                {
+                    "name": "A1",
+                    "rate": "5mbit",
+                    "selectors": [
+                        {
+                            "type": "ip",
+                            "protocol": "tcp",
+                            "sport": 55551
+                        }
+                    ]
+                },
+                {
+                    "name": "A2",
+                    "rate": "2.5mbit",
+                    "selectors": [
+                        {
+                            "type": "ip",
+                            "protocol": "tcp",
+                            "sport": 55552
+                        }
+                    ]
+                },
+                {
+                    "name": "A3",
+                    "rate": "2.5mbit",
+                    "selectors": [
+                        {
+                            "type": "ip",
+                            "protocol": "tcp",
+                            "sport": 55553
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+  }
+}

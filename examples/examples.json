@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "dev": "br0",
+  "qdisc": {
+    "kind": "htb",
+    "handle": "1:",
+    "default": "9999",
+    "r2q": 10
+  },
+  "tree": {
+    "name": "root",
+    "id": "1:1",
+    "rate": "100mbit",
+    "ceil": "100mbit",
+    "children": [
+      {
+        "name": "web_tls",
+        "rate": "10mbit",
+        "ceil": "50mbit",
+        "selectors": [
+          {
+            "type": "ip",
+            "protocol": "tcp",
+            "dport": 443
+          }
+        ]
+      },
+      {
+        "name": "dns",
+        "rate": "2mbit",
+        "ceil": "10mbit",
+        "selectors": [
+          {
+            "type": "ip",
+            "protocol": "udp",
+            "dport": 53
+          },
+          {
+            "type": "ip",
+            "protocol": "tcp",
+            "dport": 53
+          }
+        ]
+      },
+      {
+        "name": "user_a",
+        "rate": "2mbit",
+        "ceil": "10mbit",
+        "selectors": [
+          {
+            "type": "ip",
+            "src": "10.0.0.20/32"
+          }
+        ]
+      },
+      {
+        "name": "bulk",
+        "id": "1:9999",
+        "rate": "1mbit",
+        "ceil": "20mbit",
+        "selectors": [
+          {
+            "type": "fwmark",
+            "mark": 9999
+          }
+        ]
+      }
+    ]
+  }
+}
