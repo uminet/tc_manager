@@ -55,16 +55,45 @@ class QdiscConfig:
 
 
 @dataclass
+class TreeConfig:
+    qdisc: QdiscConfig
+    tree: ClassNode
+
+
+@dataclass
+class IngressConfig:
+    enable: bool = False
+    ifb: str = "ifb0"
+    qdisc: Optional[QdiscConfig] = None
+    tree: Optional[ClassNode] = None
+
+
+@dataclass
 class TcSpec:
     version: int
     dev: str
-    qdisc: QdiscConfig
-    tree: ClassNode
+    egress: TreeConfig
+    ingress: Optional[IngressConfig] = None
+    reset_only: bool = False
 
 
 # -----------------------------
 # Parsing
 # -----------------------------
+
+_ALLOWED_NODE_KEYS = {
+    "name",
+    "id",
+    "rate",
+    "ceil",
+    "burst",
+    "cburst",
+    "prio",
+    "selectors",
+    "leaf_qdisc",
+    "children",
+}
+
 
 def parse_selector(obj: Dict[str, Any]) -> Selector:
     if "type" not in obj:
@@ -81,6 +110,10 @@ def parse_leaf_qdisc(obj: Dict[str, Any]) -> LeafQdisc:
 
 
 def parse_node(obj: Dict[str, Any]) -> ClassNode:
+    unknown = set(obj.keys()) - _ALLOWED_NODE_KEYS
+    if unknown:
+        raise ValueError(f"unknown node keys: {sorted(unknown)}")
+
     selectors = [parse_selector(x) for x in obj.get("selectors", [])]
     children = [parse_node(x) for x in obj.get("children", [])]
 
@@ -102,20 +135,93 @@ def parse_node(obj: Dict[str, Any]) -> ClassNode:
     )
 
 
-def parse_spec(data: Dict[str, Any]) -> TcSpec:
+def parse_qdisc_config(obj: Dict[str, Any], default_handle: str) -> QdiscConfig:
+    return QdiscConfig(
+        kind=obj.get("kind", "htb"),
+        handle=obj.get("handle", default_handle),
+        default=str(obj.get("default", "9999")),
+        r2q=obj.get("r2q"),
+    )
+
+
+def parse_tree_config(obj: Dict[str, Any], default_handle: str) -> TreeConfig:
+    if "tree" not in obj:
+        raise ValueError("tree config missing 'tree'")
+    qdisc = parse_qdisc_config(obj.get("qdisc", {}), default_handle=default_handle)
+    tree = parse_node(obj["tree"])
+    return TreeConfig(qdisc=qdisc, tree=tree)
+
+
+def parse_legacy_spec(data: Dict[str, Any]) -> TcSpec:
     version = data.get("version", 1)
     dev = data["dev"]
 
     qdisc_obj = data.get("qdisc", {})
-    qdisc = QdiscConfig(
-        kind=qdisc_obj.get("kind", "htb"),
-        handle=qdisc_obj.get("handle", "1:"),
-        default=str(qdisc_obj.get("default", "9999")),
-        r2q=qdisc_obj.get("r2q"),
+    egress_qdisc = parse_qdisc_config(qdisc_obj, default_handle="1:")
+    egress_tree = parse_node(data["tree"])
+
+    return TcSpec(
+        version=version,
+        dev=dev,
+        egress=TreeConfig(qdisc=egress_qdisc, tree=egress_tree),
+        ingress=None,
+        reset_only=False,
     )
 
-    tree = parse_node(data["tree"])
-    return TcSpec(version=version, dev=dev, qdisc=qdisc, tree=tree)
+
+def parse_v2_spec(data: Dict[str, Any]) -> TcSpec:
+    version = data.get("version", 2)
+    dev = data["dev"]
+
+    egress_obj = data["egress"]
+    egress = parse_tree_config(egress_obj, default_handle="1:")
+
+    ingress_cfg = None
+    ingress_obj = data.get("ingress")
+    if ingress_obj is not None:
+        enable = bool(ingress_obj.get("enable", False))
+        ifb = ingress_obj.get("ifb", "ifb0")
+        qdisc = None
+        tree = None
+        if enable:
+            qdisc = parse_qdisc_config(ingress_obj.get("qdisc", {}), default_handle="2:")
+            if "tree" not in ingress_obj:
+                raise ValueError("ingress.enable=true but ingress.tree is missing")
+            tree = parse_node(ingress_obj["tree"])
+        ingress_cfg = IngressConfig(enable=enable, ifb=ifb, qdisc=qdisc, tree=tree)
+
+    return TcSpec(
+        version=version,
+        dev=dev,
+        egress=egress,
+        ingress=ingress_cfg,
+        reset_only=False,
+    )
+
+
+def parse_reset_only_spec(data: Dict[str, Any]) -> TcSpec:
+    version = data.get("version", 2)
+    dev = data["dev"]
+    ifb = data.get("ifb", "ifb0")
+
+    dummy_qdisc = QdiscConfig(kind="htb", handle="1:", default="9999", r2q=None)
+    dummy_tree = ClassNode(name="root", id="1:1", rate="1bit")
+
+    return TcSpec(
+        version=version,
+        dev=dev,
+        egress=TreeConfig(qdisc=dummy_qdisc, tree=dummy_tree),
+        ingress=IngressConfig(enable=False, ifb=ifb, qdisc=None, tree=None),
+        reset_only=True,
+    )
+
+
+def parse_spec(data: Dict[str, Any]) -> TcSpec:
+    if data.get("reset_only", False):
+        return parse_reset_only_spec(data)
+    if "egress" in data:
+        return parse_v2_spec(data)
+    return parse_legacy_spec(data)
 
 
 # -----------------------------
@@ -172,26 +278,38 @@ def port_to_u32_match(direction: str, port: int) -> List[str]:
 # Validation / normalization
 # -----------------------------
 
-def validate_spec(spec: TcSpec) -> None:
-    if spec.qdisc.kind != "htb":
-        raise ValueError(f"only htb is supported in v1, got {spec.qdisc.kind}")
+def validate_qdisc_and_tree(qdisc: QdiscConfig, tree: ClassNode, label: str) -> None:
+    if qdisc.kind != "htb":
+        raise ValueError(f"{label}: only htb is supported in v1, got {qdisc.kind}")
 
-    if not spec.qdisc.handle.endswith(":"):
-        raise ValueError(f"qdisc.handle must end with ':', got {spec.qdisc.handle}")
+    if not qdisc.handle.endswith(":"):
+        raise ValueError(f"{label}: qdisc.handle must end with ':', got {qdisc.handle}")
 
-    if spec.tree.rate is None:
-        raise ValueError("root tree node must have rate")
+    if tree.rate is None:
+        raise ValueError(f"{label}: root tree node must have rate")
 
-    if spec.tree.id is None:
-        raise ValueError("root tree node must have explicit id, e.g. '1:1'")
+    if tree.id is None:
+        raise ValueError(f"{label}: root tree node must have explicit id, e.g. '1:1'")
 
-    handle_major = spec.qdisc.handle[:-1]
-    if not spec.tree.id.startswith(f"{handle_major}:"):
+    handle_major = qdisc.handle[:-1]
+    if not tree.id.startswith(f"{handle_major}:"):
         raise ValueError(
-            f"root class id {spec.tree.id} must use same major as qdisc handle {spec.qdisc.handle}"
+            f"{label}: root class id {tree.id} must use same major as qdisc handle {qdisc.handle}"
         )
 
-    _validate_node_recursive(spec.tree, is_root=True)
+    _validate_node_recursive(tree, is_root=True)
+
+
+def validate_spec(spec: TcSpec) -> None:
+    if spec.reset_only:
+        return
+
+    validate_qdisc_and_tree(spec.egress.qdisc, spec.egress.tree, label="egress")
+
+    if spec.ingress and spec.ingress.enable:
+        if spec.ingress.qdisc is None or spec.ingress.tree is None:
+            raise ValueError("ingress.enable=true but ingress qdisc/tree missing")
+        validate_qdisc_and_tree(spec.ingress.qdisc, spec.ingress.tree, label="ingress")
 
 
 def _validate_node_recursive(node: ClassNode, is_root: bool = False) -> None:
@@ -251,12 +369,8 @@ def _validate_node_recursive(node: ClassNode, is_root: bool = False) -> None:
         _validate_node_recursive(child, is_root=False)
 
 
-def assign_ids(spec: TcSpec) -> None:
-    """
-    Auto-assign minor ids under the qdisc major if missing.
-    Root id must already exist.
-    """
-    major = spec.qdisc.handle[:-1]
+def assign_ids_for_tree(qdisc: QdiscConfig, tree: ClassNode) -> None:
+    major = qdisc.handle[:-1]
     used_minors = set()
 
     def collect_existing(node: ClassNode) -> None:
@@ -271,7 +385,7 @@ def assign_ids(spec: TcSpec) -> None:
         for c in node.children:
             collect_existing(c)
 
-    collect_existing(spec.tree)
+    collect_existing(tree)
 
     next_minor = 10
 
@@ -290,21 +404,16 @@ def assign_ids(spec: TcSpec) -> None:
                 child.id = f"{major}:{alloc_minor()}"
             assign_recursive(child)
 
-    assign_recursive(spec.tree)
+    assign_recursive(tree)
 
-def fill_defaults(spec: TcSpec) -> None:
-    ceil_mode = getattr(spec, "ceil_mode", "parent_rate")
 
+def fill_defaults_for_tree(qdisc: QdiscConfig, tree: ClassNode) -> None:
     def walk(node: ClassNode, parent: Optional[ClassNode]) -> None:
         if node.ceil is None:
-            if parent is None:
-                node.ceil = node.rate
-            elif ceil_mode == "parent_rate":
+            if parent is not None and parent.rate is not None:
                 node.ceil = parent.rate
-            elif ceil_mode == "parent_ceil":
-                node.ceil = parent.ceil or parent.rate
             else:
-                raise ValueError(f"unknown ceil_mode: {ceil_mode}")
+                node.ceil = node.rate
 
         if not node.children and node.leaf_qdisc is None:
             node.leaf_qdisc = LeafQdisc(kind="fq_codel")
@@ -313,8 +422,20 @@ def fill_defaults(spec: TcSpec) -> None:
             c.parent_id = node.id
             walk(c, node)
 
-    spec.tree.parent_id = spec.qdisc.handle
-    walk(spec.tree, None)
+    tree.parent_id = qdisc.handle
+    walk(tree, None)
+
+
+def normalize_spec(spec: TcSpec) -> None:
+    if spec.reset_only:
+        return
+
+    assign_ids_for_tree(spec.egress.qdisc, spec.egress.tree)
+    fill_defaults_for_tree(spec.egress.qdisc, spec.egress.tree)
+
+    if spec.ingress and spec.ingress.enable and spec.ingress.qdisc and spec.ingress.tree:
+        assign_ids_for_tree(spec.ingress.qdisc, spec.ingress.tree)
+        fill_defaults_for_tree(spec.ingress.qdisc, spec.ingress.tree)
 
 
 # -----------------------------
@@ -335,13 +456,12 @@ def format_selector(sel: Selector) -> str:
     return f"{sel.type}({sel.params})"
 
 
-def render_tree(spec: TcSpec) -> str:
+def render_tree(dev: str, qdisc: QdiscConfig, tree: ClassNode, title: str) -> str:
     lines: List[str] = []
 
     header = (
-        f"dev={spec.dev} "
-        f"qdisc={spec.qdisc.kind} handle={spec.qdisc.handle} "
-        f"default={spec.qdisc.default}"
+        f"[{title}] "
+        f"dev={dev} qdisc={qdisc.kind} handle={qdisc.handle} default={qdisc.default}"
     )
     lines.append(header)
 
@@ -372,8 +492,21 @@ def render_tree(spec: TcSpec) -> str:
         for idx, child in enumerate(node.children):
             walk(child, child_prefix, idx == len(node.children) - 1)
 
-    walk(spec.tree, "", True)
+    walk(tree, "", True)
     return "\n".join(lines)
+
+
+def render_spec(spec: TcSpec) -> str:
+    if spec.reset_only:
+        ifb = spec.ingress.ifb if spec.ingress else "ifb0"
+        return f"[reset-only] dev={spec.dev} ifb={ifb}"
+
+    parts = [render_tree(spec.dev, spec.egress.qdisc, spec.egress.tree, title="egress")]
+    if spec.ingress and spec.ingress.enable and spec.ingress.qdisc and spec.ingress.tree:
+        parts.append(
+            render_tree(spec.ingress.ifb, spec.ingress.qdisc, spec.ingress.tree, title="ingress-via-ifb")
+        )
+    return "\n\n".join(parts)
 
 
 # -----------------------------
@@ -390,9 +523,24 @@ def find_node_by_name_or_id(root: ClassNode, key: str) -> Optional[ClassNode]:
     return None
 
 
-def clone_spec_with_rate_change(spec: TcSpec, key: str, new_rate: str, new_ceil: Optional[str] = None) -> TcSpec:
+def clone_spec_with_rate_change(
+    spec: TcSpec,
+    key: str,
+    new_rate: str,
+    new_ceil: Optional[str] = None,
+    direction: str = "egress",
+) -> TcSpec:
     spec2 = copy.deepcopy(spec)
-    target = find_node_by_name_or_id(spec2.tree, key)
+    if spec2.reset_only:
+        raise ValueError("cannot modify class rate in reset_only mode")
+
+    tree = spec2.egress.tree if direction == "egress" else (
+        spec2.ingress.tree if spec2.ingress and spec2.ingress.tree else None
+    )
+    if tree is None:
+        raise ValueError(f"{direction} tree not found")
+
+    target = find_node_by_name_or_id(tree, key)
     if target is None:
         raise ValueError(f"node not found: {key}")
 
@@ -408,27 +556,70 @@ def clone_spec_with_rate_change(spec: TcSpec, key: str, new_rate: str, new_ceil:
 # Compilation
 # -----------------------------
 
-def emit_root_qdisc(spec: TcSpec) -> List[List[str]]:
+def emit_root_qdisc(dev: str, qdisc: QdiscConfig) -> List[List[str]]:
     cmd = [
         "tc", "qdisc", "add",
-        "dev", spec.dev,
+        "dev", dev,
         "root",
-        "handle", spec.qdisc.handle,
-        spec.qdisc.kind,
+        "handle", qdisc.handle,
+        qdisc.kind,
     ]
-    if spec.qdisc.default is not None:
-        cmd += ["default", spec.qdisc.default]
-    if spec.qdisc.r2q is not None:
-        cmd += ["r2q", str(spec.qdisc.r2q)]
+    if qdisc.default is not None:
+        cmd += ["default", qdisc.default]
+    if qdisc.r2q is not None:
+        cmd += ["r2q", str(qdisc.r2q)]
     return [cmd]
 
 
-def emit_delete_root(spec: TcSpec) -> List[List[str]]:
+def emit_delete_root(dev: str) -> List[List[str]]:
     return [[
         "tc", "qdisc", "del",
-        "dev", spec.dev,
+        "dev", dev,
         "root",
     ]]
+
+
+def emit_delete_ingress(dev: str) -> List[List[str]]:
+    return [[
+        "tc", "qdisc", "del",
+        "dev", dev,
+        "ingress",
+    ]]
+
+
+def emit_ifb_setup(ifb: str) -> List[List[str]]:
+    return [
+        ["modprobe", "ifb"],
+        ["ip", "link", "add", ifb, "type", "ifb"],
+        ["ip", "link", "set", ifb, "up"],
+    ]
+
+
+def emit_delete_ifb(ifb: str) -> List[List[str]]:
+    return [
+        ["ip", "link", "set", ifb, "down"],
+        ["ip", "link", "del", ifb, "type", "ifb"],
+    ]
+
+
+def emit_ifb_link_up(ifb: str) -> List[List[str]]:
+    return [
+        ["ip", "link", "set", ifb, "up"],
+    ]
+
+
+def emit_ingress_redirect(dev: str, ifb: str) -> List[List[str]]:
+    return [
+        ["tc", "qdisc", "add", "dev", dev, "ingress"],
+        [
+            "tc", "filter", "add",
+            "dev", dev,
+            "parent", "ffff:",
+            "protocol", "ip",
+            "matchall",
+            "action", "mirred", "egress", "redirect", "dev", ifb,
+        ],
+    ]
 
 
 def emit_class(node: ClassNode, dev: str) -> List[str]:
@@ -550,24 +741,24 @@ def emit_filter_for_selector(
     raise ValueError(f"unsupported selector type: {selector.type}")
 
 
-def compile_spec(spec: TcSpec, reset: bool = True) -> List[List[str]]:
+def compile_tree(dev: str, qdisc: QdiscConfig, tree: ClassNode, reset: bool = True) -> List[List[str]]:
     cmds: List[List[str]] = []
 
     if reset:
-        cmds.extend(emit_delete_root(spec))
+        cmds.extend(emit_delete_root(dev))
 
-    cmds.extend(emit_root_qdisc(spec))
+    cmds.extend(emit_root_qdisc(dev, qdisc))
 
     filter_prio = 1
 
     def walk(node: ClassNode) -> None:
         nonlocal filter_prio
-        cmds.append(emit_class(node, spec.dev))
+        cmds.append(emit_class(node, dev))
 
         for child in node.children:
             walk(child)
 
-        leaf_cmd = emit_leaf_qdisc(node, spec.dev)
+        leaf_cmd = emit_leaf_qdisc(node, dev)
         if leaf_cmd is not None:
             cmds.append(leaf_cmd)
 
@@ -576,14 +767,55 @@ def compile_spec(spec: TcSpec, reset: bool = True) -> List[List[str]]:
                 emit_filter_for_selector(
                     selector=sel,
                     node=node,
-                    dev=spec.dev,
-                    qdisc_handle=spec.qdisc.handle,
+                    dev=dev,
+                    qdisc_handle=qdisc.handle,
                     filter_prio=filter_prio,
                 )
             )
             filter_prio += 1
 
-    walk(spec.tree)
+    walk(tree)
+    return cmds
+
+
+def compile_spec(spec: TcSpec, reset: bool = True) -> List[List[str]]:
+    cmds: List[List[str]] = []
+
+    if spec.reset_only:
+        ifb = spec.ingress.ifb if spec.ingress else "ifb0"
+        cmds.extend(emit_delete_root(spec.dev))
+        cmds.extend(emit_delete_ingress(spec.dev))
+        cmds.extend(emit_delete_root(ifb))
+        cmds.extend(emit_delete_ifb(ifb))
+        return cmds
+
+    # egress
+    cmds.extend(compile_tree(
+        dev=spec.dev,
+        qdisc=spec.egress.qdisc,
+        tree=spec.egress.tree,
+        reset=reset,
+    ))
+
+    # ingress via ifb
+    if spec.ingress and spec.ingress.enable and spec.ingress.qdisc and spec.ingress.tree:
+        ifb = spec.ingress.ifb
+
+        if reset:
+            cmds.extend(emit_delete_ingress(spec.dev))
+            cmds.extend(emit_delete_root(ifb))
+            cmds.extend(emit_delete_ifb(ifb))
+
+        cmds.extend(emit_ifb_setup(ifb))
+        cmds.extend(emit_ifb_link_up(ifb))
+        cmds.extend(emit_ingress_redirect(spec.dev, ifb))
+        cmds.extend(compile_tree(
+            dev=ifb,
+            qdisc=spec.ingress.qdisc,
+            tree=spec.ingress.tree,
+            reset=False,
+        ))
+
     return cmds
 
 
@@ -595,11 +827,22 @@ def run_commands(commands: List[List[str]], ignore_delete_error: bool = True) ->
     for cmd in commands:
         print("+", shell_join(cmd))
         proc = subprocess.run(cmd, check=False)
-        if proc.returncode != 0:
-            is_delete_root = (len(cmd) >= 4 and cmd[:4] == ["tc", "qdisc", "del", "dev"])
-            if ignore_delete_error and is_delete_root:
-                continue
-            return proc.returncode
+
+        if proc.returncode == 0:
+            continue
+
+        is_delete_root = (len(cmd) >= 4 and cmd[:4] == ["tc", "qdisc", "del", "dev"])
+        is_add_ifb = (len(cmd) >= 6 and cmd[0:3] == ["ip", "link", "add"] and cmd[-2:] == ["type", "ifb"])
+        is_del_ifb = (len(cmd) >= 4 and cmd[0:3] == ["ip", "link", "del"])
+        is_set_ifb_down = (len(cmd) >= 5 and cmd[0:3] == ["ip", "link", "set"] and cmd[-1] == "down")
+
+        if ignore_delete_error and (is_delete_root or is_del_ifb or is_set_ifb_down):
+            continue
+
+        if is_add_ifb:
+            continue
+
+        return proc.returncode
     return 0
 
 
@@ -611,8 +854,7 @@ def load_and_prepare_spec(path: Path) -> TcSpec:
     data = json.loads(path.read_text())
     spec = parse_spec(data)
     validate_spec(spec)
-    assign_ids(spec)
-    fill_defaults(spec)
+    normalize_spec(spec)
     return spec
 
 
@@ -633,12 +875,12 @@ def main() -> int:
     p_compile.add_argument("spec", type=Path)
     p_compile.add_argument("--tree", action="store_true", help="Print ASCII class tree")
     p_compile.add_argument("--json-out", action="store_true", help="Print compiled commands as JSON")
-    p_compile.add_argument("--no-reset", action="store_true", help="Do not delete existing root qdisc first")
+    p_compile.add_argument("--no-reset", action="store_true", help="Do not delete existing qdisc first")
 
     p_apply = sub.add_parser("apply", help="Compile and execute full spec")
     p_apply.add_argument("spec", type=Path)
     p_apply.add_argument("--tree", action="store_true", help="Print ASCII class tree")
-    p_apply.add_argument("--no-reset", action="store_true", help="Do not delete existing root qdisc first")
+    p_apply.add_argument("--no-reset", action="store_true", help="Do not delete existing qdisc first")
 
     p_check = sub.add_parser("check", help="Validate spec only")
     p_check.add_argument("spec", type=Path)
@@ -649,6 +891,7 @@ def main() -> int:
     p_set_rate.add_argument("target", help="node name or class id")
     p_set_rate.add_argument("rate", help="new rate, e.g. 500kbit")
     p_set_rate.add_argument("--ceil", help="new ceil, default=same as rate")
+    p_set_rate.add_argument("--direction", choices=["egress", "ingress"], default="egress")
     p_set_rate.add_argument("--apply", action="store_true", help="Execute tc command")
     p_set_rate.add_argument("--tree", action="store_true", help="Print ASCII class tree after change")
 
@@ -657,12 +900,14 @@ def main() -> int:
     p_pause.add_argument("target", help="node name or class id")
     p_pause.add_argument("--paused-rate", default="1kbit", help="paused rate")
     p_pause.add_argument("--paused-ceil", default="1kbit", help="paused ceil")
+    p_pause.add_argument("--direction", choices=["egress", "ingress"], default="egress")
     p_pause.add_argument("--apply", action="store_true", help="Execute tc command")
     p_pause.add_argument("--tree", action="store_true", help="Print ASCII class tree after change")
 
     p_resume = sub.add_parser("resume", help="Resume one class using values from spec")
     p_resume.add_argument("spec", type=Path)
     p_resume.add_argument("target", help="node name or class id")
+    p_resume.add_argument("--direction", choices=["egress", "ingress"], default="egress")
     p_resume.add_argument("--apply", action="store_true", help="Execute tc command")
     p_resume.add_argument("--tree", action="store_true", help="Print ASCII class tree")
 
@@ -673,7 +918,7 @@ def main() -> int:
             spec = load_and_prepare_spec(args.spec)
             print("spec OK")
             if args.tree:
-                print(render_tree(spec))
+                print(render_spec(spec))
             return 0
 
         if args.command == "compile":
@@ -681,7 +926,7 @@ def main() -> int:
             cmds = compile_spec(spec, reset=not args.no_reset)
 
             if args.tree:
-                print(render_tree(spec))
+                print(render_spec(spec))
                 print()
 
             if args.json_out:
@@ -695,22 +940,32 @@ def main() -> int:
             cmds = compile_spec(spec, reset=not args.no_reset)
 
             if args.tree:
-                print(render_tree(spec))
+                print(render_spec(spec))
                 print()
 
             return run_commands(cmds)
 
         if args.command == "set-rate":
             spec = load_and_prepare_spec(args.spec)
-            spec2 = clone_spec_with_rate_change(spec, args.target, args.rate, args.ceil)
-            target = find_node_by_name_or_id(spec2.tree, args.target)
+            spec2 = clone_spec_with_rate_change(spec, args.target, args.rate, args.ceil, direction=args.direction)
+
+            tree = spec2.egress.tree if args.direction == "egress" else (
+                spec2.ingress.tree if spec2.ingress and spec2.ingress.tree else None
+            )
+            dev = spec2.dev if args.direction == "egress" else (
+                spec2.ingress.ifb if spec2.ingress else None
+            )
+            if tree is None or dev is None:
+                raise ValueError(f"{args.direction} tree/dev not found")
+
+            target = find_node_by_name_or_id(tree, args.target)
             if target is None:
                 raise ValueError(f"node not found after change: {args.target}")
 
-            cmd = emit_class_replace(target, spec2.dev)
+            cmd = emit_class_replace(target, dev)
 
             if args.tree:
-                print(render_tree(spec2))
+                print(render_spec(spec2))
                 print()
 
             print(shell_join(cmd))
@@ -720,15 +975,31 @@ def main() -> int:
 
         if args.command == "pause":
             spec = load_and_prepare_spec(args.spec)
-            spec2 = clone_spec_with_rate_change(spec, args.target, args.paused_rate, args.paused_ceil)
-            target = find_node_by_name_or_id(spec2.tree, args.target)
+            spec2 = clone_spec_with_rate_change(
+                spec,
+                args.target,
+                args.paused_rate,
+                args.paused_ceil,
+                direction=args.direction,
+            )
+
+            tree = spec2.egress.tree if args.direction == "egress" else (
+                spec2.ingress.tree if spec2.ingress and spec2.ingress.tree else None
+            )
+            dev = spec2.dev if args.direction == "egress" else (
+                spec2.ingress.ifb if spec2.ingress else None
+            )
+            if tree is None or dev is None:
+                raise ValueError(f"{args.direction} tree/dev not found")
+
+            target = find_node_by_name_or_id(tree, args.target)
             if target is None:
                 raise ValueError(f"node not found after pause: {args.target}")
 
-            cmd = emit_class_replace(target, spec2.dev)
+            cmd = emit_class_replace(target, dev)
 
             if args.tree:
-                print(render_tree(spec2))
+                print(render_spec(spec2))
                 print()
 
             print(shell_join(cmd))
@@ -738,14 +1009,26 @@ def main() -> int:
 
         if args.command == "resume":
             spec = load_and_prepare_spec(args.spec)
-            target = find_node_by_name_or_id(spec.tree, args.target)
+            if spec.reset_only:
+                raise ValueError("cannot resume class in reset_only mode")
+
+            tree = spec.egress.tree if args.direction == "egress" else (
+                spec.ingress.tree if spec.ingress and spec.ingress.tree else None
+            )
+            dev = spec.dev if args.direction == "egress" else (
+                spec.ingress.ifb if spec.ingress else None
+            )
+            if tree is None or dev is None:
+                raise ValueError(f"{args.direction} tree/dev not found")
+
+            target = find_node_by_name_or_id(tree, args.target)
             if target is None:
                 raise ValueError(f"node not found: {args.target}")
 
-            cmd = emit_class_replace(target, spec.dev)
+            cmd = emit_class_replace(target, dev)
 
             if args.tree:
-                print(render_tree(spec))
+                print(render_spec(spec))
                 print()
 
             print(shell_join(cmd))
