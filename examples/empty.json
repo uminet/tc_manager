@@ -1,0 +1,6 @@
+{
+  "version": 2,
+  "dev": "br0",
+  "reset_only": true,
+  "ifb": "ifb0"
+}
