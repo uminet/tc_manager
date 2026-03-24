@@ -1052,7 +1052,7 @@ def main() -> int:
             return 0
 
         if args.command == "apply":
-            spec = load_and_prepare_spec(args.spec, strict=not args.no_strct)
+            spec = load_and_prepare_spec(args.spec, strict=not args.no_strict)
             cmds = compile_spec(spec, reset=not args.no_reset)
 
             if args.tree:
