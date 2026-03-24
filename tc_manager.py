@@ -291,6 +291,7 @@ _RATE_UNITS_BITS = {
     "gbps": 8 * 10**9,
     "tbps": 8 * 10**12,
 }
+REST_RATE_KEYWORD = "rest"
 
 _RATE_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)\s*$")
 
@@ -332,9 +333,8 @@ def validate_htb_policy_tree(
     parent_rate_bps = parse_rate_to_bps(node.rate)
     
     if node.ceil is None:
-        parent_ceil_bps = parse_rate_to_bps(node.rate)
-    else:
-        parent_ceil_bps = parse_rate_to_bps(node.ceil)
+        raise ValueError(f"{path}: internal node missing ceil")
+    parent_ceil_bps = parse_rate_to_bps(node.ceil)
 
     sum_child_rate_bps = 0
 
@@ -346,9 +346,8 @@ def validate_htb_policy_tree(
             raise ValueError(f"{child_path}: missing rate")
         child_rate_bps = parse_rate_to_bps(child.rate)
         if child.ceil is None:
-            child_ceil_bps = parse_rate_to_bps(child.rate)
-        else:
-            child_ceil_bps = parse_rate_to_bps(child.ceil)
+            raise ValueError(f"{child_path}: missing ceil")
+        child_ceil_bps = parse_rate_to_bps(child.ceil)
 
         sum_child_rate_bps += child_rate_bps
 
@@ -534,6 +533,48 @@ def fill_defaults_for_tree(qdisc: QdiscConfig, tree: ClassNode) -> None:
 
     tree.parent_id = qdisc.handle
     walk(tree, None)
+    
+def resolve_rest_rates_for_tree(tree: ClassNode) -> None:
+    def walk(node: ClassNode) -> None:
+        if node.children:
+            rest_children = [c for c in node.children if c.rate == "rest"]
+
+            if len(rest_children) > 1:
+                raise ValueError(
+                    f"node {node.name or node.id!r} has multiple children with rate='rest'"
+                )
+
+            if rest_children:
+                if node.rate is None:
+                    raise ValueError(
+                        f"parent node {node.name or node.id!r} must have rate when a child uses rate='rest'"
+                    )
+
+                parent_rate_bps = parse_rate_to_bps(node.rate)
+                used_bps = 0
+
+                for child in node.children:
+                    if child.rate == "rest":
+                        continue
+                    if child.rate is None:
+                        raise ValueError(
+                            f"child node {child.name or child.id!r} missing rate"
+                        )
+                    used_bps += parse_rate_to_bps(child.rate)
+
+                remaining_bps = parent_rate_bps - used_bps
+                if remaining_bps <= 0:
+                    raise ValueError(
+                        f"node {node.name or node.id!r}: rate='rest' resolves to "
+                        f"{remaining_bps} bit; parent rate is exhausted"
+                    )
+
+                rest_children[0].rate = fmt_bps(remaining_bps)
+
+            for child in node.children:
+                walk(child)
+
+    walk(tree)
 
 
 def normalize_spec(spec: TcSpec) -> None:
@@ -541,10 +582,12 @@ def normalize_spec(spec: TcSpec) -> None:
         return
 
     assign_ids_for_tree(spec.egress.qdisc, spec.egress.tree)
+    resolve_rest_rates_for_tree(spec.egress.tree)
     fill_defaults_for_tree(spec.egress.qdisc, spec.egress.tree)
 
     if spec.ingress and spec.ingress.enable and spec.ingress.qdisc and spec.ingress.tree:
         assign_ids_for_tree(spec.ingress.qdisc, spec.ingress.tree)
+        resolve_rest_rates_for_tree(spec.ingress.tree)
         fill_defaults_for_tree(spec.ingress.qdisc, spec.ingress.tree)
         
 # -----------------------------
@@ -962,12 +1005,12 @@ def run_commands(commands: List[List[str]], ignore_delete_error: bool = True) ->
 def load_and_prepare_spec(path: Path, *, strict: bool = False) -> TcSpec:
     data = json.loads(path.read_text())
     spec = parse_spec(data)
+    normalize_spec(spec)
 
     problems = validate_spec(spec, strict=strict)
     for p in problems:
         print(p, file=sys.stderr)
 
-    normalize_spec(spec)
     return spec
 
 

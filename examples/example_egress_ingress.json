@@ -16,7 +16,7 @@
         {
           "name": "default",
           "id": "1:9999",
-          "rate": "995mbit",
+          "rate": "rest",
           "selectors": [
             { "type": "fwmark", "mark": 9999 }
           ]
@@ -52,7 +52,7 @@
         {
           "name": "default",
           "id": "2:9999",
-          "rate": "995mbit"
+          "rate": "rest"
         },
         {
           "name": "svc_55551_ingress",

@@ -16,7 +16,7 @@
         {
           "name": "default",
           "id": "1:9999",
-          "rate": "1000mbit"
+          "rate": "rest"
         }
       ]
     }
@@ -38,7 +38,7 @@
         {
           "name": "default",
           "id": "2:9999",
-          "rate": "1000mbit"
+          "rate": "rest"
         }
       ]
     }
