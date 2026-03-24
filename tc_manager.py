@@ -11,6 +11,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import re
+from decimal import Decimal
 
 
 # -----------------------------
@@ -247,8 +249,7 @@ def parse_protocol(value: Any) -> str:
     if proto not in ("tcp", "udp"):
         raise ValueError(f"unsupported protocol {value!r}, only tcp/udp supported")
     return proto
-
-
+    
 def cidr_to_u32_match(network: str, direction: str) -> List[str]:
     net = ipaddress.ip_network(network, strict=False)
     if net.version != 4:
@@ -278,6 +279,100 @@ def port_to_u32_match(direction: str, port: int) -> List[str]:
 # Validation / normalization
 # -----------------------------
 
+_RATE_UNITS_BITS = {
+    "bit": 1,
+    "kbit": 10**3,
+    "mbit": 10**6,
+    "gbit": 10**9,
+    "tbit": 10**12,
+    "bps": 8,
+    "kbps": 8 * 10**3,
+    "mbps": 8 * 10**6,
+    "gbps": 8 * 10**9,
+    "tbps": 8 * 10**12,
+}
+
+_RATE_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)\s*$")
+
+
+def parse_rate_to_bps(value: str) -> int:
+    m = _RATE_RE.match(value)
+    if not m:
+        raise ValueError(f"invalid rate value: {value!r}")
+
+    amount = Decimal(m.group(1))
+    unit = m.group(2).lower()
+    if unit not in _RATE_UNITS_BITS:
+        raise ValueError(
+            f"unsupported rate unit {unit!r} in {value!r}; "
+            f"supported: {', '.join(sorted(_RATE_UNITS_BITS))}"
+        )
+    return int(amount * _RATE_UNITS_BITS[unit])
+
+
+def fmt_bps(bps: int) -> str:
+    for unit, scale in (("gbit", 10**9), ("mbit", 10**6), ("kbit", 10**3)):
+        if bps % scale == 0 and bps >= scale:
+            return f"{bps // scale}{unit}"
+    return f"{bps}bit"
+
+
+def validate_htb_policy_tree(
+    node: ClassNode,
+    path: str,
+    *,
+    strict: bool,
+    problems: List[str],
+) -> None:
+    if not node.children:
+        return
+
+    if node.rate is None:
+        raise ValueError(f"{path}: internal node missing rate")
+    parent_rate_bps = parse_rate_to_bps(node.rate)
+    
+    if node.ceil is None:
+        parent_ceil_bps = parse_rate_to_bps(node.rate)
+    else:
+        parent_ceil_bps = parse_rate_to_bps(node.ceil)
+
+    sum_child_rate_bps = 0
+
+    for child in node.children:
+        child_name = child.name or child.id or "<unnamed>"
+        child_path = f"{path}/{child_name}"
+
+        if child.rate is None:
+            raise ValueError(f"{child_path}: missing rate")
+        child_rate_bps = parse_rate_to_bps(child.rate)
+        if child.ceil is None:
+            child_ceil_bps = parse_rate_to_bps(child.rate)
+        else:
+            child_ceil_bps = parse_rate_to_bps(child.ceil)
+
+        sum_child_rate_bps += child_rate_bps
+
+        if child_ceil_bps > parent_ceil_bps:
+            raise ValueError(
+                f"{child_path}: child ceil {child.ceil} exceeds parent ceil {node.ceil}"
+            )
+
+        validate_htb_policy_tree(
+            child,
+            child_path,
+            strict=strict,
+            problems=problems,
+        )
+
+    if sum_child_rate_bps > parent_rate_bps:
+        msg = (
+            f"{path}: sum(child.rate)={fmt_bps(sum_child_rate_bps)} exceeds "
+            f"parent.rate={node.rate}"
+        )
+        if strict:
+            raise ValueError(msg)
+        problems.append("WARNING: " + msg)
+
 def validate_qdisc_and_tree(qdisc: QdiscConfig, tree: ClassNode, label: str) -> None:
     if qdisc.kind != "htb":
         raise ValueError(f"{label}: only htb is supported in v1, got {qdisc.kind}")
@@ -300,17 +395,32 @@ def validate_qdisc_and_tree(qdisc: QdiscConfig, tree: ClassNode, label: str) -> 
     _validate_node_recursive(tree, is_root=True)
 
 
-def validate_spec(spec: TcSpec) -> None:
+def validate_spec(spec: TcSpec, *, strict: bool = False) -> List[str]:
+    problems: List[str] = []
+
     if spec.reset_only:
-        return
+        return problems
 
     validate_qdisc_and_tree(spec.egress.qdisc, spec.egress.tree, label="egress")
+    validate_htb_policy_tree(
+        spec.egress.tree,
+        path="egress/" + (spec.egress.tree.name or spec.egress.tree.id or "root"),
+        strict=strict,
+        problems=problems,
+    )
 
     if spec.ingress and spec.ingress.enable:
         if spec.ingress.qdisc is None or spec.ingress.tree is None:
             raise ValueError("ingress.enable=true but ingress qdisc/tree missing")
         validate_qdisc_and_tree(spec.ingress.qdisc, spec.ingress.tree, label="ingress")
+        validate_htb_policy_tree(
+            spec.ingress.tree,
+            path="ingress/" + (spec.ingress.tree.name or spec.ingress.tree.id or "root"),
+            strict=strict,
+            problems=problems,
+        )
 
+    return problems
 
 def _validate_node_recursive(node: ClassNode, is_root: bool = False) -> None:
     if not is_root and node.rate is None:
@@ -411,7 +521,7 @@ def fill_defaults_for_tree(qdisc: QdiscConfig, tree: ClassNode) -> None:
     def walk(node: ClassNode, parent: Optional[ClassNode]) -> None:
         if node.ceil is None:
             if parent is not None and parent.rate is not None:
-                node.ceil = parent.rate
+                node.ceil = parent.ceil
             else:
                 node.ceil = node.rate
 
@@ -436,8 +546,7 @@ def normalize_spec(spec: TcSpec) -> None:
     if spec.ingress and spec.ingress.enable and spec.ingress.qdisc and spec.ingress.tree:
         assign_ids_for_tree(spec.ingress.qdisc, spec.ingress.tree)
         fill_defaults_for_tree(spec.ingress.qdisc, spec.ingress.tree)
-
-
+        
 # -----------------------------
 # Rendering
 # -----------------------------
@@ -850,10 +959,14 @@ def run_commands(commands: List[List[str]], ignore_delete_error: bool = True) ->
 # Load / prepare
 # -----------------------------
 
-def load_and_prepare_spec(path: Path) -> TcSpec:
+def load_and_prepare_spec(path: Path, *, strict: bool = False) -> TcSpec:
     data = json.loads(path.read_text())
     spec = parse_spec(data)
-    validate_spec(spec)
+
+    problems = validate_spec(spec, strict=strict)
+    for p in problems:
+        print(p, file=sys.stderr)
+
     normalize_spec(spec)
     return spec
 
@@ -876,15 +989,18 @@ def main() -> int:
     p_compile.add_argument("--tree", action="store_true", help="Print ASCII class tree")
     p_compile.add_argument("--json-out", action="store_true", help="Print compiled commands as JSON")
     p_compile.add_argument("--no-reset", action="store_true", help="Do not delete existing qdisc first")
+    p_compile.add_argument("--no_strict", action="store_true", help="Dont treat HTB parent/child policy violations as errors")
 
     p_apply = sub.add_parser("apply", help="Compile and execute full spec")
     p_apply.add_argument("spec", type=Path)
     p_apply.add_argument("--tree", action="store_true", help="Print ASCII class tree")
     p_apply.add_argument("--no-reset", action="store_true", help="Do not delete existing qdisc first")
+    p_apply.add_argument("--no_strict", action="store_true", help="Dont treat HTB parent/child policy violations as errors")
 
     p_check = sub.add_parser("check", help="Validate spec only")
     p_check.add_argument("spec", type=Path)
     p_check.add_argument("--tree", action="store_true", help="Print ASCII class tree")
+    p_check.add_argument("--no_strict", action="store_true", help="Dont treat HTB parent/child policy violations as errors")
 
     p_set_rate = sub.add_parser("set-rate", help="Replace one class rate/ceil by name or id")
     p_set_rate.add_argument("spec", type=Path)
@@ -915,14 +1031,14 @@ def main() -> int:
 
     try:
         if args.command == "check":
-            spec = load_and_prepare_spec(args.spec)
+            spec = load_and_prepare_spec(args.spec, strict=not args.no_strict)
             print("spec OK")
             if args.tree:
                 print(render_spec(spec))
             return 0
 
         if args.command == "compile":
-            spec = load_and_prepare_spec(args.spec)
+            spec = load_and_prepare_spec(args.spec, strict=not args.no_strict)
             cmds = compile_spec(spec, reset=not args.no_reset)
 
             if args.tree:
@@ -936,7 +1052,7 @@ def main() -> int:
             return 0
 
         if args.command == "apply":
-            spec = load_and_prepare_spec(args.spec)
+            spec = load_and_prepare_spec(args.spec, strict=not args.no_strct)
             cmds = compile_spec(spec, reset=not args.no_reset)
 
             if args.tree:
